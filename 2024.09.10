@@ -1,0 +1,135 @@
+2024.09.10
+
+import pandas as pd
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+
+# List of paths for different schools
+school_paths = [
+    "/content/drive/MyDrive/🍁 /UdS/Thesis/Projects/Alpha",
+    "/content/drive/MyDrive/🍁 /UdS/Thesis/Projects/Curé-Paquin",
+    "/content/drive/MyDrive/🍁 /UdS/Thesis/Projects/Horizon-du-Lac",
+    "/content/drive/MyDrive/🍁 /UdS/Thesis/Projects/Marie-Soleil-Tougas",
+    "/content/drive/MyDrive/🍁 /UdS/Thesis/Projects/De_la_Clé-des-Champs",
+    "/content/drive/MyDrive/🍁 /UdS/Thesis/Projects/École_Domaine_Vert-Nord", 
+    "/content/drive/MyDrive/🍁 /UdS/Thesis/Projects/Gaston-Pilon(300209825)",
+    "/content/drive/MyDrive/🍁 /UdS/Thesis/Projects/Gaston-Pilon(300206515)",
+    "/content/drive/MyDrive/🍁 /UdS/Thesis/Projects/Gaston-Pilon(300205293)_(no_data_for_Aug_2022)",
+    "/content/drive/MyDrive/🍁 /UdS/Thesis/Projects/Des_Perséides,pavillon_des_Primevères",   
+]
+
+# Hydro-Québec Rate M parameters:
+  # The structure of monthly Rate M for an annual contract is as follows (page 53):
+    # $16.962 per kilowatt of billing demand, plus
+    # 5.851¢ per kilowatthour for the first 210,000 kilowatthours, and 
+    # 4.339¢ per kilowatthour for the remaining consumption.
+
+demand_rate = 16.962   # CAD per kW (monthly)
+energy_rate_first_210kWh = 0.05851  # CAD per kWh for the first 210,000 kWh
+energy_rate_above_210kWh = 0.04339  # CAD per kWh for consumption above 210,000 kWh
+threshold_kWh = 210000  # kWh
+
+# List to store bill information for each school and month
+bills_summary = []
+
+# Loop through each school's directory
+for school_path in school_paths:
+    csv_files = [file for file in os.listdir(school_path) if file.endswith('.csv')]  # Get a list of all CSV files in the directory
+    df_all_school = pd.DataFrame()  # Initialize an empty DataFrame to store all data for the current school
+    highest_demand_kW = 0  # Initialize a variable to store the highest demand over 12 months
+
+    # Initialize lists for plotting
+    months = []
+    total_energy_kWh_list = []
+    peak_demand_kW_list = []
+
+    # Process each CSV file (each month)
+    for filename in csv_files:
+        full_path = os.path.join(school_path, filename)
+        
+        df = pd.read_csv(full_path, delimiter=';', decimal=',') # Read the CSV file into a DataFrame, specifying ';' as the delimiter
+        
+        # Check if the DataFrame has at least two columns
+        if df.shape[1] >= 2:
+            df.iloc[:, 1] = df.iloc[:, 1].astype(str) #Convert the second column (Date and time) to strings and handle any potential issues, and Ensure column is treated as string
+            df.iloc[:, 1] = pd.to_datetime(df.iloc[:, 1], errors='coerce') # Convert the Date and time column to datetime, with errors='coerce' to handle invalid dates
+            df = df.dropna(subset=[df.columns[1]]) # Drop rows where the Date and time column has NaT (Not a Time) values due to conversion errors
+            df.iloc[:, 2] = pd.to_numeric(df.iloc[:, 2], errors='coerce') # Convert the 'Real power' column to numeric, forcing non-convertible values to NaN
+            df = df.dropna(subset=[df.columns[2]]) # Drop rows with NaN in the 'Real power' column  
+            df_all_school = pd.concat([df_all_school, df], ignore_index=True) # Append the processed data to the combined DataFrame for plotting
+
+            # Calculate total energy consumption in kWh (assuming 15-minute intervals)
+            df['Energy_kWh'] = (df.iloc[:, 2] / 4)  # Convert kW to kWh for 15-minute intervals
+            total_energy_kWh = df['Energy_kWh'].sum() # Calculate the total energy consumed
+            peak_demand_kW = df.iloc[:, 2].max() # Find the peak power demand in kW
+            highest_demand_kW = max(highest_demand_kW, peak_demand_kW) # Update the highest demand for the school
+
+            # Calculate the energy cost
+            if total_energy_kWh <= threshold_kWh:
+                energy_cost = total_energy_kWh * energy_rate_first_210kWh
+            else:
+                energy_cost = (threshold_kWh * energy_rate_first_210kWh +
+                               (total_energy_kWh - threshold_kWh) * energy_rate_above_210kWh)
+
+            # Minimum billing demand is the highest demand of the current month
+            billing_demand_kW = peak_demand_kW
+            demand_cost = billing_demand_kW * demand_rate
+
+            # Calculate the total electricity bill for this month
+            total_bill = energy_cost + demand_cost
+
+            # Extract the first date in the file for table (month and year)
+            first_date = df.iloc[0, 1]
+            month_year_label = first_date.strftime('%m-%Y')
+
+            # Store the bill information in the list for later table creation
+            bills_summary.append({
+                "School": os.path.basename(school_path),
+                "Month-Year": month_year_label,
+                "Total Energy Consumption (kWh)": round(total_energy_kWh, 2),
+                "Peak Demand (kW)": round(peak_demand_kW, 2),
+                "Energy Cost (CAD)": round(energy_cost, 2),
+                "Demand Cost (CAD)": round(demand_cost, 2),
+                "Total Electricity Bill (CAD)": round(total_bill, 2)
+            })
+
+            # Add data for plotting
+            months.append(month_year_label)
+            total_energy_kWh_list.append(total_energy_kWh)
+            peak_demand_kW_list.append(peak_demand_kW)
+
+    # Plot total energy consumption and peak demand
+    plt.figure(figsize=(14, 6))
+
+    plt.subplot(1, 2, 1)
+    plt.plot(months, total_energy_kWh_list, marker='o', linestyle='-', color='b')
+    plt.title(f'Total Energy Consumption - {os.path.basename(school_path)}')
+    plt.xlabel('Month-Year')
+    plt.ylabel('Total Energy Consumption (kWh)')
+    plt.xticks(rotation=45)
+    plt.grid(True)
+
+    plt.subplot(1, 2, 2)
+    plt.plot(months, peak_demand_kW_list, marker='o', linestyle='-', color='r')
+    plt.title(f'Peak Demand - {os.path.basename(school_path)}')
+    plt.xlabel('Month-Year')
+    plt.ylabel('Peak Demand (kW)')
+    plt.xticks(rotation=45)
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+# Convert the bills summary list into a DataFrame for easy table formatting
+bills_df = pd.DataFrame(bills_summary)
+
+# Print the table in a clean format
+print(bills_df)
+
+# Optionally, to save the table in CSV format if needed (but per the request, not necessary now)
+# bills_df.to_csv("electricity_bills_rate_m.csv", index=False)
+
+# Display the summary DataFrame
+bills_df
+

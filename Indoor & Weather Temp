@@ -1,0 +1,715 @@
+import os
+import re
+import unicodedata
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+# ============================================================
+#  Robust CSV loader for INDOOR files (encodings, delimiters, headers)
+# ============================================================
+
+DATE_PAT = re.compile(
+    r"(\d{4}[-/]\d{1,2}[-/]\d{1,2})|(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})"
+)
+
+def find_data_start(fp, encodings=("utf-8-sig", "utf-8", "latin1")):
+    """
+    Find first line that looks like it contains a date
+    -> used to skip device metadata header lines.
+    """
+    for enc in encodings:
+        try:
+            with open(fp, "r", encoding=enc, errors="ignore") as f:
+                for i, line in enumerate(f):
+                    if DATE_PAT.search(line):
+                        return i
+        except Exception:
+            continue
+    return 0
+
+def try_read_csv(fp):
+    """
+    Try pandas sniffing first (sep=None), then fallback encodings & delimiters.
+    Returns a DataFrame with all columns as strings.
+    """
+    last_err = None
+    start = find_data_start(fp)
+
+    # First attempt: let pandas sniff the separator
+    try:
+        return pd.read_csv(
+            fp,
+            sep=None,
+            engine="python",
+            skiprows=start,
+            encoding="utf-8-sig",
+            dtype=str
+        )
+    except Exception as e:
+        last_err = e
+
+    # Fallback grid of (encoding, delimiter)
+    for enc in ("utf-8-sig", "utf-8", "latin1"):
+        for delim in (";", ",", "\t", "|"):
+            try:
+                return pd.read_csv(
+                    fp,
+                    delimiter=delim,
+                    skiprows=start,
+                    encoding=enc,
+                    dtype=str
+                )
+            except Exception as e:
+                last_err = e
+                continue
+
+    raise last_err
+
+def pick_timestamp_and_temperature(df):
+    """
+    Auto-pick best timestamp and temperature columns by parse success rates.
+    Returns (ts_col_name, temp_col_name) or (None, None).
+    """
+    if df.shape[1] < 2:
+        return None, None
+
+    # --- pick timestamp column ---
+    dt_scores = {}
+    for col in df.columns:
+        s = pd.to_datetime(df[col], errors="coerce", infer_datetime_format=True)
+        dt_scores[col] = s.notna().mean()
+
+    ts_col = max(dt_scores, key=dt_scores.get)
+    ts_score = dt_scores[ts_col]
+
+    # --- pick numeric (temperature) column ---
+    num_scores = {}
+    for col in df.columns:
+        if col == ts_col:
+            continue
+        s = df[col].astype(str).str.replace(",", ".", regex=False)
+        s = pd.to_numeric(s, errors="coerce")
+        num_scores[col] = s.notna().mean()
+
+    if not num_scores:
+        return None, None
+
+    temp_col = max(num_scores, key=num_scores.get)
+    temp_score = num_scores[temp_col]
+
+    if ts_score < 0.3 or temp_score < 0.3:
+        return None, None
+
+    return ts_col, temp_col
+
+# ============================================================
+#  Name normalization & folder resolution
+# ============================================================
+
+def _normalize(s: str) -> str:
+    """Normalize accents & curly quotes for robust matching."""
+    s = s.strip().lower().replace("’", "'").replace("‘", "'")
+    s = unicodedata.normalize('NFD', s)
+    return ''.join(ch for ch in s if not unicodedata.combining(ch))
+
+def find_school_folder_or_files(base_dirs, requested_name):
+    """
+    Tries to find a folder whose basename matches requested_name (normalized),
+    scanning recursively across all base_dirs. If not found, returns a list
+    of CSV files whose filenames contain the normalized school name.
+
+    Returns:
+        ("folder", full_folder_path) OR
+        ("files", [list_of_csv_paths]) OR
+        (None, None)
+    """
+    norm_req = _normalize(requested_name)
+
+    # 1) Look for folder matches
+    candidate_folders = []
+    for base in base_dirs:
+        if not os.path.isdir(base):
+            continue
+        for root, dirs, files in os.walk(base):
+            for d in dirs:
+                if _normalize(d) == norm_req or norm_req in _normalize(d):
+                    candidate_folders.append(os.path.join(root, d))
+
+    if candidate_folders:
+        candidate_folders.sort(key=len)  # prefer shortest path
+        return ("folder", candidate_folders[0])
+
+    # 2) Fallback: match CSV filenames
+    matched_files = []
+    for base in base_dirs:
+        if not os.path.isdir(base):
+            continue
+        for root, dirs, files in os.walk(base):
+            for f in files:
+                if f.lower().endswith(".csv") and norm_req in _normalize(f):
+                    matched_files.append(os.path.join(root, f))
+
+    if matched_files:
+        return ("files", matched_files)
+
+    return (None, None)
+
+# ============================================================
+#  CONFIG (Windows local path)
+# ============================================================
+
+DATA_ROOT = r"C:\Users\lotm6444\Documents\UdS-PhD\Projects\CSSMI\Schools_indoor_temp"
+
+BASE_DIRS = [
+    DATA_ROOT,
+    os.path.join(DATA_ROOT, "All"),
+    os.path.join(DATA_ROOT, "EB"),
+]
+
+SCHOOLS = [
+    "École de l’Aquarelle",
+    "Jeunes Du Mondes",
+]
+
+FREQ = "15min"      # target resolution
+MAX_FILL = None     # None = unlimited ffill/bfill
+
+# ============================================================
+#  IO & processing for INDOOR temperature
+# ============================================================
+
+def read_school_temperature_series_from_paths(paths):
+    """Read a list of CSV paths into a single [Timestamp, Temperature] DataFrame."""
+    rows = []
+    for fp in paths:
+        try:
+            raw = try_read_csv(fp)
+
+            if raw.shape[1] < 2:
+                print(f"[SKIP] {os.path.basename(fp)}: <2 columns. Shape={raw.shape}")
+                continue
+
+            ts_col, temp_col = pick_timestamp_and_temperature(raw)
+            if ts_col is None or temp_col is None:
+                print(f"[SKIP] {os.path.basename(fp)}: couldn’t identify timestamp/temperature columns.")
+                continue
+
+            ts = pd.to_datetime(raw[ts_col], errors="coerce", infer_datetime_format=True)
+            temp = raw[temp_col].astype(str).str.replace(",", ".", regex=False)
+            temp = pd.to_numeric(temp, errors="coerce")
+
+            good = pd.DataFrame({"Timestamp": ts, "Temperature": temp}).dropna()
+            if good.empty:
+                print(f"[WARN] {os.path.basename(fp)}: all rows invalid after parsing.")
+            else:
+                rows.append(good)
+        except Exception as e:
+            print(f"[WARN] {fp}: {e}")
+            continue
+
+    if not rows:
+        return pd.DataFrame(columns=["Timestamp", "Temperature"])
+
+    out = pd.concat(rows, ignore_index=True)
+    out = out.drop_duplicates(subset=["Timestamp"]).sort_values("Timestamp")
+    return out
+
+def read_school_temperature_series_from_folder(folder):
+    paths = [
+        os.path.join(folder, f)
+        for f in os.listdir(folder)
+        if f.lower().endswith(".csv")
+    ]
+    return read_school_temperature_series_from_paths(paths)
+
+def regularize_and_interpolate(df, freq=FREQ, max_fill=MAX_FILL):
+    """
+    Resample to a regular grid, then fill gaps:
+    - average on resample
+    - optional limited ffill/bfill (if max_fill is not None)
+    - time interpolation for remaining gaps
+    """
+    if df.empty:
+        return df
+
+    s = df.set_index("Timestamp").sort_index()
+    s = s.resample(freq).mean()
+
+    if max_fill is not None:
+        s["Temperature"] = s["Temperature"].ffill(limit=max_fill).bfill(limit=max_fill)
+
+    s["Temperature"] = s["Temperature"].interpolate(method="time", limit_direction="both")
+    return s.reset_index()
+
+def compute_typical_week(df_reg):
+    """
+    Build typical week:
+      mean temperature per (weekday, time-of-day).
+    Returns:
+      tidy: columns [Weekday, Time, Temperature]
+      pivot: index=Time, columns=Weekday, values=Temperature
+    """
+    if df_reg.empty:
+        return (pd.DataFrame(columns=["Weekday", "Time", "Temperature"]),
+                pd.DataFrame())
+
+    df = df_reg.copy()
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+    df["Timestamp"] = df["Timestamp"].dt.floor(FREQ)
+    df["Weekday"] = df["Timestamp"].dt.weekday  # 0=Mon..6=Sun
+    df["Time"] = df["Timestamp"].dt.time
+
+    grp = df.groupby(["Weekday", "Time"], as_index=False)["Temperature"].mean()
+    pivot = grp.pivot(index="Time", columns="Weekday", values="Temperature").sort_index()
+    return grp, pivot
+
+# ============================================================
+#  Representative SUMMER/WINTER Typical Day Profiles (INDOOR)
+# ============================================================
+
+def compute_representative_day(df_reg):
+    """
+    Computes representative SUMMER and WINTER day profiles for INDOOR data:
+      - Summer: June, July, August
+      - Winter: December, January, February
+    Returns: (summer_profile, winter_profile)
+    Each profile: DataFrame with ['Hour', 'Temperature']
+    """
+    if df_reg.empty:
+        return None, None
+
+    df = df_reg.copy()
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+    df["Month"] = df["Timestamp"].dt.month
+    df["Hour"] = df["Timestamp"].dt.hour
+
+    # Winter: Dec–Feb
+    winter_df = df[df["Month"].isin([12, 1, 2])]
+    winter_profile = None
+    if not winter_df.empty:
+        winter_profile = (
+            winter_df.groupby("Hour")["Temperature"]
+                     .mean()
+                     .reset_index()
+                     .sort_values("Hour")
+        )
+
+    # Summer: Jun–Aug
+    summer_df = df[df["Month"].isin([6, 7, 8])]
+    summer_profile = None
+    if not summer_df.empty:
+        summer_profile = (
+            summer_df.groupby("Hour")["Temperature"]
+                     .mean()
+                     .reset_index()
+                     .sort_values("Hour")
+        )
+
+    return summer_profile, winter_profile
+
+def plot_representative_day(profile, school, season_name):
+    """
+    Plot a representative 24h day profile.
+    """
+    if profile is None or profile.empty:
+        print(f"[INFO] No {season_name} data for {school}")
+        return
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(profile["Hour"], profile["Temperature"], linewidth=2)
+
+    plt.title(f"{school} — Representative {season_name} Day Temperature Profile")
+    plt.xlabel("Hour of Day")
+    plt.ylabel("Temperature (°C)")
+    plt.xticks(range(0, 24, 2))
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+# ============================================================
+#  Day/Night Setpoints from Representative Summer/Winter Day
+# ============================================================
+
+def estimate_setpoints(rep_profile, season_name, school, day_hours=range(6, 18)):
+    """
+    Estimate day/night setpoints from a representative day profile.
+    rep_profile must have columns: ["Hour", "Temperature"]
+    """
+    if rep_profile is None or rep_profile.empty:
+        print(f"[INFO] No {season_name} representative day for {school}")
+        return None
+
+    df = rep_profile.copy()
+    df["Hour"] = df["Hour"].astype(int)
+
+    day_mask = df["Hour"].isin(day_hours)   # Day = 06:00–17:59
+    night_mask = ~day_mask                  # Night = other hours
+
+    day_setpoint = df.loc[day_mask, "Temperature"].mean()
+    night_setpoint = df.loc[night_mask, "Temperature"].mean()
+
+    return {
+        "Day_Setpoint": day_setpoint,
+        "Night_Setpoint": night_setpoint
+    }
+
+def print_setpoint_summary(school, summer_sp, winter_sp):
+    print("\n===============================")
+    print(f" Setpoints for {school}")
+    print("===============================")
+
+    if summer_sp:
+        print("🌞 SUMMER:")
+        print(f"  Day   Setpoint ≈ {summer_sp['Day_Setpoint']:.2f} °C")
+        print(f"  Night Setpoint ≈ {summer_sp['Night_Setpoint']:.2f} °C")
+    else:
+        print("🌞 SUMMER: No data")
+
+    if winter_sp:
+        print("❄️ WINTER:")
+        print(f"  Day   Setpoint ≈ {winter_sp['Day_Setpoint']:.2f} °C")
+        print(f"  Night Setpoint ≈ {winter_sp['Night_Setpoint']:.2f} °C")
+    else:
+        print("❄️ WINTER: No data")
+
+def build_setpoint_profile(day_setpoint, night_setpoint, day_hours=range(6, 18)):
+    """
+    Build a 24-hour step profile:
+      - day_hours -> day_setpoint
+      - other hours -> night_setpoint
+    """
+    hours = list(range(24))
+    values = []
+    for h in hours:
+        if h in day_hours:
+            values.append(day_setpoint)
+        else:
+            values.append(night_setpoint)
+    return pd.DataFrame({"Hour": hours, "Setpoint": values})
+
+def plot_setpoint_profiles(school, summer_sp, winter_sp):
+    """
+    Plot Summer and Winter setpoint profiles on the same graph.
+    """
+    if summer_sp is None and winter_sp is None:
+        print(f"[INFO] No setpoint data to plot for {school}")
+        return
+
+    plt.figure(figsize=(10, 5))
+
+    if summer_sp is not None:
+        summer_curve = build_setpoint_profile(
+            summer_sp["Day_Setpoint"],
+            summer_sp["Night_Setpoint"]
+        )
+        plt.plot(
+            summer_curve["Hour"], summer_curve["Setpoint"],
+            linewidth=2.5, label="Summer Setpoint", color="orange"
+        )
+
+    if winter_sp is not None:
+        winter_curve = build_setpoint_profile(
+            winter_sp["Day_Setpoint"],
+            winter_sp["Night_Setpoint"]
+        )
+        plt.plot(
+            winter_curve["Hour"], winter_curve["Setpoint"],
+            linewidth=2.5, label="Winter Setpoint", color="blue"
+        )
+
+    plt.title(f"{school} – Daily HVAC Setpoint Profile (Summer vs Winter)")
+    plt.xlabel("Hour of Day")
+    plt.ylabel("Temperature (°C)")
+    plt.xticks(range(0, 24, 2))
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+# ============================================================
+#  Plotting helpers for INDOOR typical week & raw data
+# ============================================================
+
+def plot_raw_timeseries(df_raw, school):
+    if df_raw.empty:
+        print(f"[INFO] No raw data to plot for {school}")
+        return
+
+    plt.figure(figsize=(12, 4))
+    plt.plot(df_raw["Timestamp"], df_raw["Temperature"], linewidth=0.8)
+    plt.title(f"{school} — Raw Temperature vs Time")
+    plt.xlabel("Time")
+    plt.ylabel("Temperature (°C)")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+def plot_typical_week_line(pivot, school, freq_label=FREQ):
+    """
+    Typical week per-day curves + dashed 'mean weekdays' (Mon–Fri).
+    """
+    if pivot.empty:
+        print(f"[INFO] No data to plot for {school}")
+        return
+
+    times = pd.to_datetime(pivot.index.astype(str))  # dummy date + HH:MM:SS
+    plt.figure(figsize=(11, 5))
+    day_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+    for wd in range(7):
+        if wd in pivot.columns:
+            plt.plot(times, pivot[wd], label=day_labels[wd], linewidth=1.5)
+
+    weekday_cols = [c for c in range(5) if c in pivot.columns]  # Mon..Fri
+    if weekday_cols:
+        weekday_mean = pivot[weekday_cols].mean(axis=1)
+        plt.plot(times, weekday_mean, linestyle="--", linewidth=2.5, label="mean weekdays")
+
+    ax = plt.gca()
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    plt.title(f"{school} — Typical Week Temperature Profile ({freq_label})")
+    plt.xlabel("Time of Day")
+    plt.ylabel("Temperature (°C)")
+    plt.xticks(rotation=45)
+    plt.grid(True, alpha=0.3)
+    plt.legend(ncol=4)
+    plt.tight_layout()
+    plt.show()
+
+def plot_typical_week_heatmap(pivot, school):
+    if pivot.empty:
+        return
+
+    hm = pivot.T  # Weekday x Time
+    plt.figure(figsize=(12, 4.5))
+    im = plt.imshow(hm.values, aspect='auto', interpolation='nearest')
+    plt.title(f"{school} — Typical Week Temperature (Heatmap)")
+    plt.yticks(
+        ticks=range(7),
+        labels=["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    )
+    n_cols = hm.shape[1]
+    step = max(1, n_cols // 12)
+    xticks = np.arange(0, n_cols, step)
+    xlabels = [str(list(hm.columns)[i])[:5] for i in xticks]  # HH:MM
+    plt.xticks(xticks, xlabels, rotation=45)
+    cbar = plt.colorbar(im)
+    cbar.set_label("Temperature (°C)")
+    plt.tight_layout()
+    plt.show()
+
+# ============================================================
+#  WEATHER DATA MODULE – Mirabel hourly file
+# ============================================================
+
+def load_weather_file(weather_path):
+    """
+    Load Mirabel hourly weather (time vs Temperature) without using column names.
+    Assumes:
+      - first column = timestamp (e.g., 'date_time_local')
+      - second column = temperature (°C)
+
+    Returns DataFrame: [Timestamp, Temperature]
+    """
+    df = pd.read_csv(weather_path)
+
+    if df.shape[1] < 2:
+        print("[ERROR] Weather CSV must have at least 2 columns (time, temperature).")
+        return pd.DataFrame(columns=["Timestamp", "Temperature"])
+
+    # Extract first two columns
+    ts_raw = df.iloc[:, 0].astype(str)
+
+    # Remove timezone tokens like ' EDT' or ' EST' (to avoid warnings)
+    ts_raw = ts_raw.str.replace(r"\s(EDT|EST)$", "", regex=True)
+
+    ts = pd.to_datetime(ts_raw, errors="coerce")
+
+    temp = pd.to_numeric(df.iloc[:, 1], errors="coerce")
+
+    out = pd.DataFrame({"Timestamp": ts, "Temperature": temp}).dropna()
+    out = out.sort_values("Timestamp")
+    return out
+
+def regularize_weather(df, freq="15min"):
+    """
+    Convert hourly (or irregular) weather to regular freq (default 15-min) by interpolation.
+    """
+    if df.empty:
+        return df
+
+    s = df.set_index("Timestamp").sort_index()
+    s = s.resample(freq).mean()
+    s["Temperature"] = s["Temperature"].interpolate("time")
+    return s.reset_index()
+
+def compute_weather_representative_day(df):
+    """
+    Build representative summer and winter typical days from weather data.
+    Uses:
+       Summer: Jun–Aug
+       Winter: Dec–Feb
+    Returns: (summer_profile, winter_profile)
+    """
+    if df.empty:
+        return None, None
+
+    df = df.copy()
+    df["Month"] = df["Timestamp"].dt.month
+    df["Hour"] = df["Timestamp"].dt.hour
+
+    # Winter
+    winter_df = df[df["Month"].isin([12, 1, 2])]
+    winter_profile = None
+    if not winter_df.empty:
+        winter_profile = (
+            winter_df.groupby("Hour")["Temperature"]
+                     .mean()
+                     .reset_index()
+                     .sort_values("Hour")
+        )
+
+    # Summer
+    summer_df = df[df["Month"].isin([6, 7, 8])]
+    summer_profile = None
+    if not summer_df.empty:
+        summer_profile = (
+            summer_df.groupby("Hour")["Temperature"]
+                     .mean()
+                     .reset_index()
+                     .sort_values("Hour")
+        )
+
+    return summer_profile, winter_profile
+
+def plot_weather_representative(profile, season_name):
+    if profile is None or profile.empty:
+        print(f"[INFO] No weather data for {season_name}")
+        return
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(profile["Hour"], profile["Temperature"], linewidth=2)
+    plt.title(f"Weather – Representative {season_name} Day (Mirabel)")
+    plt.xlabel("Hour of Day")
+    plt.ylabel("Temperature (°C)")
+    plt.xticks(range(0, 24, 2))
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+# ============================================================
+#  MAIN PIPELINE
+# ============================================================
+
+def build_typical_weeks_for_all_schools(
+    base_dirs=BASE_DIRS,
+    schools=SCHOOLS,
+    freq=FREQ,
+    max_fill=MAX_FILL,
+    show_heatmap=False
+):
+    print("Base dirs:")
+    for b in base_dirs:
+        print("   ", b, "-> exists:", os.path.isdir(b))
+
+    results = {}
+
+    # ---------- Process each school (INDOOR) ----------
+    for school in schools:
+        mode, resource = find_school_folder_or_files(base_dirs, school)
+        if mode is None:
+            print(f"[SKIP] {school}: not found as folder or file pattern in any base.")
+            continue
+
+        if mode == "folder":
+            folder = resource
+            csvs = [f for f in os.listdir(folder) if f.lower().endswith(".csv")]
+            print(f"🔍 {school}: folder match -> {folder} ({len(csvs)} CSVs)")
+            raw = read_school_temperature_series_from_folder(folder)
+        else:
+            files = resource
+            print(f"🔍 {school}: file-pattern match -> {len(files)} CSVs")
+            raw = read_school_temperature_series_from_paths(files)
+
+        # --- 1) Raw indoor data plot ---
+        plot_raw_timeseries(raw, school)
+
+        # --- 2) Regularize + typical week ---
+        reg = regularize_and_interpolate(raw, freq=freq, max_fill=max_fill)
+        tidy, pivot = compute_typical_week(reg)
+
+        # --- 3) Typical-week plot ---
+        plot_typical_week_line(pivot, school, freq_label=freq)
+        if show_heatmap:
+            plot_typical_week_heatmap(pivot, school)
+
+        # --- 4) Representative Summer & Winter days (INDOOR) ---
+        summer_prof, winter_prof = compute_representative_day(reg)
+        plot_representative_day(summer_prof, school, "Summer")
+        plot_representative_day(winter_prof, school, "Winter")
+
+        # --- 5) Estimate Day/Night setpoints + plot profiles ---
+        summer_sp = estimate_setpoints(summer_prof, "Summer", school)
+        winter_sp = estimate_setpoints(winter_prof, "Winter", school)
+        print_setpoint_summary(school, summer_sp, winter_sp)
+        plot_setpoint_profiles(school, summer_sp, winter_sp)
+
+        # --- 6) Store results ---
+        results[school] = {
+            "raw": raw,
+            "regularized": reg,
+            "tidy": tidy,
+            "pivot": pivot,
+            "summer_profile": summer_prof,
+            "winter_profile": winter_prof,
+            "summer_setpoints": summer_sp,
+            "winter_setpoints": winter_sp,
+        }
+
+    # ---------- Process WEATHER once (Option A) ----------
+    weather_path = os.path.join(
+        r"C:\Users\lotm6444\Documents\UdS-PhD\Projects\CSSMI\Schools_indoor_temp",
+        "weatherstats_mirabel_hourly.csv"
+    )
+
+    if os.path.isfile(weather_path):
+        print("\n=== Processing Weather File ===")
+        wx_raw = load_weather_file(weather_path)
+
+        # 1) Raw weather plot
+        plt.figure(figsize=(12, 4))
+        plt.plot(wx_raw["Timestamp"], wx_raw["Temperature"], linewidth=0.8)
+        plt.title("Mirabel Weather – Raw Hourly Temperature")
+        plt.xlabel("Time")
+        plt.ylabel("Temperature (°C)")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+        # 2) Upsample to 15-min resolution
+        wx_reg = regularize_weather(wx_raw, freq="15min")
+
+        # 3) Representative summer/winter weather days
+        wx_summer, wx_winter = compute_weather_representative_day(wx_reg)
+        plot_weather_representative(wx_summer, "Summer")
+        plot_weather_representative(wx_winter, "Winter")
+
+        results["WEATHER"] = {
+            "raw": wx_raw,
+            "regularized": wx_reg,
+            "summer_profile": wx_summer,
+            "winter_profile": wx_winter,
+        }
+    else:
+        print("\n[WARNING] Weather file not found at:", weather_path)
+
+    return results
+
+# ============================================================
+#  RUN SCRIPT
+# ============================================================
+
+if __name__ == "__main__":
+    results = build_typical_weeks_for_all_schools()
